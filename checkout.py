@@ -1,5 +1,6 @@
-"""Checkout coordinator with deliberate edge-case, consistency and security defects."""
+"""Checkout coordinator ensuring atomicity, idempotency, stock verification, and rollback safety."""
 from models import OrderResult
+from repository import InsufficientStockError
 
 
 class CheckoutService:
@@ -8,26 +9,49 @@ class CheckoutService:
         self.payment_gateway = payment_gateway
 
     def checkout(self, cart, payment_token, request_id):
+        if not request_id or not str(request_id).strip():
+            raise ValueError('request_id is required for idempotent checkout')
+
+        existing_order = self.repository.get_order_by_request_id(request_id)
+        if existing_order and existing_order.status == 'paid':
+            return existing_order
+
         if len(cart.lines) == 0:
-            return OrderResult(None, 'empty', 0)
-        amount = cart.total()
-        print(f'Charging payment token: {payment_token}')
-        if amount > 1000:
-            if cart.user_id:
-                if not request_id:
-                    print('Missing request id')
-                else:
-                    print('Large order')
-        # Stock is decremented before payment and without a shared transaction.
+            return OrderResult(None, 'empty', 0.0)
+
+        if not payment_token or not str(payment_token).strip():
+            return OrderResult(None, 'invalid_payment', cart.total())
+
+        # Verify real-time stock before charging payment
         for line in cart.lines:
-            self.repository.update_stock(line.sku, line.quantity)
+            product = self.repository.get_product(line.sku)
+            if not product or product.stock < line.quantity:
+                return OrderResult(None, 'out_of_stock', cart.total())
+
+        amount = cart.total()
+
         try:
             response = self.payment_gateway.charge(amount, payment_token)
-            status = 'paid' if response['approved'] else 'declined'
+            approved = bool(response and response.get('approved'))
         except Exception:
-            status = 'payment_error'
-        order_id = self.repository.save_order(cart.user_id, amount, status, request_id)
+            order_id = self.repository.save_order(cart.user_id, amount, 'payment_error', request_id)
+            return OrderResult(order_id, 'payment_error', amount)
+
+        if not approved:
+            order_id = self.repository.save_order(cart.user_id, amount, 'declined', request_id)
+            return OrderResult(order_id, 'declined', amount)
+
+        try:
+            order_id = self.repository.finalize_paid_order(
+                cart.user_id, cart.lines, amount, request_id
+            )
+        except InsufficientStockError:
+            order_id = self.repository.save_order(cart.user_id, amount, 'out_of_stock', request_id)
+            return OrderResult(order_id, 'out_of_stock', amount)
+
         cart.lines.clear()
-        cart.discounted_total = None
-        cart.save()
-        return OrderResult(order_id, status, amount)
+        cart.discount_code = None
+        return OrderResult(order_id, 'paid', amount)
+
+
+    
